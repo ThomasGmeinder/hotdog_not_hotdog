@@ -15,8 +15,14 @@ parser = argparse.ArgumentParser(
 
 parser.add_argument('-is', '--image-side', default=224, type=int, help='Image Side')
 parser.add_argument('-ne', '--num-epochs', default=8, type=int, help='Epochs')
+parser.add_argument('-bs', '--batch-size', default=32, type=int, help='Batch Size')
+parser.add_argument('-gac', '--gradient-accumulation-count', default=1, type=int, help='Gradient Accumulation Count per Replica')
 parser.add_argument('-t', '--target', default="IPU", type=str, help='Hardware Target')
+parser.add_argument('-nio', '--num-io-tiles', default=0, type=int, help='Number of I/O Tiles')
+parser.add_argument('-nr', '--num-replicas', default=1, type=int, help='Number of Replicas')
 args = parser.parse_args()
+
+print(args)
 
 #Hyperparameters
 IMAGE_SIDE = args.image_side
@@ -25,15 +31,22 @@ IMAGE_SHAPE = (IMAGE_SIDE, IMAGE_SIDE)
 
 # Training Parameters
 NUM_EPOCHS = args.num_epochs
+BATCH_SIZE = args.batch_size
 DROPOUT_RATE = 0.2
 VALIDATION_SPLIT = 0.2
 VERBOSE = 1
 
-BATCH_SIZE=32
+train_data_dir = "/localdata/thomasg/ai_transfer_learning/training_and_validation_images"
 
-STEPS_PER_EPOCH = 10
-STEPS_PER_EXECUTION = 100
-
+import os
+file_count = sum(len(files) for _, _, files in os.walk(train_data_dir))
+NUM_SAMPLES = file_count #All files used for training and validation
+print(NUM_SAMPLES)
+#NUM_SAMPLES = 3200
+STEPS_PER_EPOCH = NUM_SAMPLES // BATCH_SIZE # stpep
+STEPS_PER_EPOCH *= args.num_replicas
+print(f"STEPS_PER_EPOCH {STEPS_PER_EPOCH}")
+STEPS_PER_EXECUTION = STEPS_PER_EPOCH
 ############################ ResNet50 ##############################
 # NUM_EPOCHS = 4
 # validation accuracy is: 0.9534 
@@ -56,11 +69,14 @@ STEPS_PER_EXECUTION = 100
 # CPU: 10/10 [==============================] - 3s 344ms/step - loss: 0.1236 - accuracy: 0.9563 - val_loss: 0.0167 - val_accuracy: 1.0000
 
 def create_model():
+  import importlib
   ### Import model
   #from tensorflow.keras.applications.resnet50 import ResNet50 as model
   #from tensorflow.keras.applications.resnet_v2 import ResNet50V2 as model
   #from tensorflow.keras.applications.efficientnet import EfficientNetB4 as model
   from tensorflow.keras.applications import MobileNetV2 as model
+  # no worky: model = importlib.import_module("tensorflow.keras.applications", "MobileNetV2")
+  print(model)
   
   # Create headless model
   headless_model = model(include_top=False, input_shape=INPUT_SHAPE)
@@ -78,11 +94,12 @@ def create_model():
   outputs = classifier(x)
 
   model = tf.keras.Model(inputs, outputs, name=f"{headless_model.name}_hotdog")
+  model.set_pipelining_options(gradient_accumulation_steps_per_replica=args.gradient_accumulation_count)
+
+
   model.summary()
   return model
 
-
-train_data_dir = "/localdata/thomasg/ai_transfer_learning/training_and_validation_images"
 # Training Data Generation
 # Cannot create Dataset from this 
 # from tensorflow.keras.preprocessing.image import ImageDataGenerator
@@ -105,6 +122,19 @@ class CollectBatchStats(tf.keras.callbacks.Callback):
 
 batch_stats_callback = CollectBatchStats()
 
+def optimise_io(dataset):
+  # Enable prefetch to decrease StreamCopyBegin proportion
+  dataset = dataset.cache() 
+  dataset = dataset.prefetch(STEPS_PER_EPOCH) # Will prefetch STEPS_PER_EPOCH batches!
+  # this doesn't 
+  # Note: swapping this doesn't get rid of this warining:
+  #   The calling iterator did not fully read the dataset being cached. 
+  #   In order to avoid unexpected truncation of the dataset, the partially cached contents of the dataset will be discarded. 
+  #   This can happen if you have an input pipeline similar to `dataset.cache().take(k).repeat()`. You should use `dataset.take(k).cache().repeat()` instead.
+
+  return dataset
+
+
 
 # I followed https://docs.graphcore.ai/projects/tensorflow-user-guide/en/latest/examples_tf2.html#training-on-the-ipu 
 # to a large extent
@@ -126,7 +156,7 @@ def train_model(model):
         image_size=(IMAGE_SHAPE[0], IMAGE_SHAPE[1]),
         #This does not achieve a defined shape in dimention 1: batch_size=BATCH_SIZE
         )
-
+    print(training_dataset.cardinality())
     validation_dataset = tf.keras.preprocessing.image_dataset_from_directory(
         train_data_dir,
         validation_split=VALIDATION_SPLIT, # Use 20% of data for validation
@@ -143,16 +173,18 @@ def train_model(model):
 
     # Workaround: unbatch and then batch with explicit BATCH_SIZE
     training_dataset = training_dataset.unbatch()
-    training_dataset = training_dataset.batch(BATCH_SIZE, drop_remainder=True)
+    training_dataset = training_dataset.batch(BATCH_SIZE, drop_remainder=True).repeat()
+    training_dataset = optimise_io(training_dataset)
 
     validation_dataset = validation_dataset.unbatch()
-    validation_dataset = validation_dataset.batch(BATCH_SIZE, drop_remainder=True)
+    validation_dataset = validation_dataset.batch(BATCH_SIZE, drop_remainder=True).repeat()
+    validation_dataset = optimise_io(validation_dataset)
 
     print(f"Executing model.fit(...)")
     history = model.fit(
-        training_dataset.repeat(),
+        training_dataset,
         epochs = NUM_EPOCHS,
-        validation_data=validation_dataset.repeat(),
+        validation_data=validation_dataset,
         steps_per_epoch = STEPS_PER_EPOCH,
         validation_steps = int(VALIDATION_SPLIT*STEPS_PER_EPOCH), # why is this not automatically derived?
         verbose=VERBOSE,
@@ -162,12 +194,19 @@ def train_model(model):
 if __name__ == "__main__":
   if args.target=="IPU":
       # Configure the IPU system
+      print("Training on IPU")
       cfg = ipu.config.IPUConfig()
-      cfg.auto_select_ipus = 1
+      cfg.auto_select_ipus = args.num_replicas
+      if args.num_io_tiles>0:
+        print(f"Enabling {args.num_io_tiles} IO Tiles")
+        cfg.io_tiles.num_io_tiles = args.num_io_tiles
+        cfg.io_tiles.place_ops_on_io_tiles = True
       cfg.configure_ipu_system()
+
       # Create an IPU distribution strategy.
       strategy = ipu.ipu_strategy.IPUStrategy()
   else:
+      print("Training on CPU")
       #strategy = DummyStrategy()
       strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0")
       #strategy = tf.distribute.Strategy("CPU")
