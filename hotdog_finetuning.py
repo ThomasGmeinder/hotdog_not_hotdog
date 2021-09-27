@@ -6,6 +6,11 @@ import time
 from tensorflow import keras
 from tensorflow.python import ipu
 
+# For distributed training with poprun
+from tensorflow.python.ipu import horovod as hvd
+import popdist
+hvd.init()
+
 import argparse
 
 parser = argparse.ArgumentParser(
@@ -20,7 +25,15 @@ parser.add_argument('-gac', '--gradient-accumulation-count', default=1, type=int
 parser.add_argument('-t', '--target', default="IPU", type=str, help='Hardware Target')
 parser.add_argument('-nio', '--num-io-tiles', default=0, type=int, help='Number of I/O Tiles')
 parser.add_argument('-nr', '--num-replicas', default=1, type=int, help='Number of Replicas')
+parser.add_argument('-np', '--num-pipeline-stages', default=1, type=int, help='Number of Pipeline Stages')
+parser.add_argument('-popvg', '--create-popvision-graph-report', action='store_true', help='Enable popvision graph report generation') #False if argument is not used!
+parser.add_argument('-popvs', '--create-popvision-system-report', action='store_true', help='Enable popvision system report generation') #False if argument is not used!
+parser.add_argument('-mn', '--model-name', default="EfficientNetB4", choices=['EfficientNetB4', 'MobileNetV2'], help='Specify the model name') #False if argument is not used!
+
+
 args = parser.parse_args()
+
+param_id_string = f'bs{args.batch_size}_gac{args.gradient_accumulation_count}_is{args.image_side}_nio{args.num_io_tiles}'
 
 print(args)
 
@@ -43,10 +56,12 @@ file_count = sum(len(files) for _, _, files in os.walk(train_data_dir))
 NUM_SAMPLES = file_count #All files used for training and validation
 print(NUM_SAMPLES)
 #NUM_SAMPLES = 3200
-STEPS_PER_EPOCH = NUM_SAMPLES // BATCH_SIZE # stpep
+global_batch_size = BATCH_SIZE * popdist.getNumTotalReplicas()
+effective_batch_size = BATCH_SIZE * args.gradient_accumulation_count
+STEPS_PER_EPOCH = NUM_SAMPLES // global_batch_size # stpep
 STEPS_PER_EPOCH *= args.num_replicas
 print(f"STEPS_PER_EPOCH {STEPS_PER_EPOCH}")
-STEPS_PER_EXECUTION = STEPS_PER_EPOCH
+
 ############################ ResNet50 ##############################
 # NUM_EPOCHS = 4
 # validation accuracy is: 0.9534 
@@ -73,9 +88,13 @@ def create_model():
   ### Import model
   #from tensorflow.keras.applications.resnet50 import ResNet50 as model
   #from tensorflow.keras.applications.resnet_v2 import ResNet50V2 as model
-  #from tensorflow.keras.applications.efficientnet import EfficientNetB4 as model
-  from tensorflow.keras.applications import MobileNetV2 as model
-  # no worky: model = importlib.import_module("tensorflow.keras.applications", "MobileNetV2")
+  if args.model_name == "EfficientNetB4":
+    from tensorflow.keras.applications.efficientnet import EfficientNetB4 as model
+  elif args.model_name == "MobileNetV2":
+    from tensorflow.keras.applications import MobileNetV2 as model
+  # no worky: 
+  #model = importlib.import_module("tensorflow.keras.applications", "MobileNetV2")
+  #model = importlib.import_module("..MobileNetV2", "tensorflow.keras.applications.MobileNetV2")
   print(model)
   
   # Create headless model
@@ -94,8 +113,6 @@ def create_model():
   outputs = classifier(x)
 
   model = tf.keras.Model(inputs, outputs, name=f"{headless_model.name}_hotdog")
-  model.set_pipelining_options(gradient_accumulation_steps_per_replica=args.gradient_accumulation_count)
-
 
   model.summary()
   return model
@@ -125,7 +142,7 @@ batch_stats_callback = CollectBatchStats()
 def optimise_io(dataset):
   # Enable prefetch to decrease StreamCopyBegin proportion
   dataset = dataset.cache() 
-  dataset = dataset.prefetch(STEPS_PER_EPOCH) # Will prefetch STEPS_PER_EPOCH batches!
+  dataset = dataset.prefetch(args.gradient_accumulation_count) # Will prefetch gradient_accumulation_count batches!
   # this doesn't 
   # Note: swapping this doesn't get rid of this warining:
   #   The calling iterator did not fully read the dataset being cached. 
@@ -134,7 +151,16 @@ def optimise_io(dataset):
 
   return dataset
 
-
+def configure_dataset(dataset):
+    # Workaround: unbatch and then batch with explicit BATCH_SIZE
+    dataset = dataset.unbatch()
+    dataset = dataset.batch(BATCH_SIZE, drop_remainder=True).repeat()
+    dataset = optimise_io(dataset)
+  
+    # shard for distributed training with poprun
+    dataset = dataset.shard(
+      num_shards=popdist.getNumInstances(), index=popdist.getInstanceIndex())
+    return dataset
 
 # I followed https://docs.graphcore.ai/projects/tensorflow-user-guide/en/latest/examples_tf2.html#training-on-the-ipu 
 # to a large extent
@@ -143,7 +169,7 @@ def train_model(model):
     model.compile(
         optimizer=tf.keras.optimizers.Adam(),
         loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        steps_per_execution=STEPS_PER_EXECUTION,
+        steps_per_execution=STEPS_PER_EPOCH,
         metrics=['accuracy']
     )
 
@@ -156,7 +182,7 @@ def train_model(model):
         image_size=(IMAGE_SHAPE[0], IMAGE_SHAPE[1]),
         #This does not achieve a defined shape in dimention 1: batch_size=BATCH_SIZE
         )
-    print(training_dataset.cardinality())
+
     validation_dataset = tf.keras.preprocessing.image_dataset_from_directory(
         train_data_dir,
         validation_split=VALIDATION_SPLIT, # Use 20% of data for validation
@@ -171,14 +197,9 @@ def train_model(model):
     # total_samples = len(training_dataset) + len(validation_dataset)
     #print(f"Total samples in the Dataset: {total_samples}")
 
-    # Workaround: unbatch and then batch with explicit BATCH_SIZE
-    training_dataset = training_dataset.unbatch()
-    training_dataset = training_dataset.batch(BATCH_SIZE, drop_remainder=True).repeat()
-    training_dataset = optimise_io(training_dataset)
+    training_dataset = configure_dataset(training_dataset)
 
-    validation_dataset = validation_dataset.unbatch()
-    validation_dataset = validation_dataset.batch(BATCH_SIZE, drop_remainder=True).repeat()
-    validation_dataset = optimise_io(validation_dataset)
+    validation_dataset = configure_dataset(validation_dataset)
 
     print(f"Executing model.fit(...)")
     history = model.fit(
@@ -191,36 +212,52 @@ def train_model(model):
         callbacks=[batch_stats_callback]
     )
 
-if __name__ == "__main__":
-  if args.target=="IPU":
-      # Configure the IPU system
-      print("Training on IPU")
-      cfg = ipu.config.IPUConfig()
-      cfg.auto_select_ipus = args.num_replicas
-      if args.num_io_tiles>0:
-        print(f"Enabling {args.num_io_tiles} IO Tiles")
-        cfg.io_tiles.num_io_tiles = args.num_io_tiles
-        cfg.io_tiles.place_ops_on_io_tiles = True
-      cfg.configure_ipu_system()
+# Configure the IPU system
+def config_ipu(verbose_model_name):
+  cfg = ipu.config.IPUConfig()
+  cfg.auto_select_ipus = args.num_replicas
+  if args.create_popvision_graph_report:
+    report_name = f'report_{verbose_model_name}'   
+    print(f"Adding compilation_poplar_options to config to create report {report_name}")
+    cfg.compilation_poplar_options = {
+      #'POPLAR_ENGINE_OPTIONS': {
+        "autoReport.all":"true", 
+        "autoReport.directory":f'{report_name}',
+      #}
+    }
+  if args.num_io_tiles>0:
+    print(f"Enabling {args.num_io_tiles} IO Tiles")
+    cfg.io_tiles.num_io_tiles = args.num_io_tiles
+    cfg.io_tiles.place_ops_on_io_tiles = True
+  cfg.configure_ipu_system()
 
-      # Create an IPU distribution strategy.
-      strategy = ipu.ipu_strategy.IPUStrategy()
-  else:
-      print("Training on CPU")
-      #strategy = DummyStrategy()
-      strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0")
-      #strategy = tf.distribute.Strategy("CPU")
-  
-  with strategy.scope():
-        model = create_model()
-        print(f"Model name: {model.name}")
-        train_model(model)
-
+def save_model(verbose_model_name):
   timestamp = time.time()
-
-  export_path = "./saved_models/retrained_{}_{}".format(model.name, int(timestamp))
+  export_path = f"./saved_models/retrained_{verbose_model_name}_{int(timestamp)}"
   model.save(export_path)
   print(f"saved model to {export_path}")
+
+if __name__ == "__main__":
+
+  if args.target=="IPU":
+      print("Training on IPU")
+      # Create an IPU distribution strategy.
+      strategy = ipu.ipu_strategy.IPUStrategy()
+      with strategy.scope():
+        model = create_model()
+        model.set_pipelining_options(gradient_accumulation_steps_per_replica=args.gradient_accumulation_count)
+        verbose_model_name = f'IPU_{model.name}_{param_id_string}'
+        config_ipu(verbose_model_name)
+        train_model(model)
+        save_model(verbose_model_name)
+  else:
+      print("Training on CPU")
+      strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0")
+      with strategy.scope():
+        model = create_model()
+        verbose_model_name = f'CPU_{model.name}_{param_id_string}'
+        train_model(model)
+        save_model(verbose_model_name)
 
 # Evaluate is done as part of fit with validation_data
 '''
