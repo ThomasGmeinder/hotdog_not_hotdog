@@ -4,7 +4,9 @@ Keras example: MobilenetV2 finetuning on the IPU
 This example creates a headless pretrained computer vision model (e.g. MobileNetV2) and adds a classification layer that will be trained to classify images into the categories hotdog and not-hotdog.
 
 Execute ``hotdog_finetuning.py --help`` for information on arguments and default settings.
-E.g. the ``--target`` argument can be used to switch between IPU (default) and CPU.
+E.g.:
+* The ``--target`` argument can be used to switch between IPU (default) and CPU.
+* The ``--model-name`` argument can be used to select the pretrained model.
 
 Requirements:
 * Installed and enabled Poplar
