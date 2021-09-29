@@ -29,13 +29,16 @@ parser.add_argument('-np', '--num-pipeline-stages', default=1, type=int, help='N
 parser.add_argument('-popvg', '--create-popvision-graph-report', action='store_true', help='Enable popvision graph report generation') #False if argument is not used!
 parser.add_argument('-popvs', '--create-popvision-system-report', action='store_true', help='Enable popvision system report generation') #False if argument is not used!
 parser.add_argument('-mn', '--model-name', default="EfficientNetB4", choices=['EfficientNetB4', 'MobileNetV2'], help='Specify the model name') #False if argument is not used!
-
+parser.add_argument('-idt', '--input-dtype', default='fp32', choices=['fp32', 'fp16', 'int8'], help="Choose input data type") 
 
 args = parser.parse_args()
 
 param_id_string = f'bs{args.batch_size}_gac{args.gradient_accumulation_count}_is{args.image_side}_nio{args.num_io_tiles}'
 
 print(args)
+
+# Training Data
+train_data_dir = "./ai_transfer_learning/training_and_validation_images"
 
 #Hyperparameters
 IMAGE_SIDE = args.image_side
@@ -48,8 +51,6 @@ BATCH_SIZE = args.batch_size
 DROPOUT_RATE = 0.2
 VALIDATION_SPLIT = 0.2
 VERBOSE = 1
-
-train_data_dir = "/localdata/thomasg/ai_transfer_learning/training_and_validation_images"
 
 import os
 file_count = sum(len(files) for _, _, files in os.walk(train_data_dir))
@@ -151,10 +152,24 @@ def optimise_io(dataset):
 
   return dataset
 
+def labeled_data_mapfun(data, labels):
+  return(tf.cast(data, np.uint8), labels)
+
 def configure_dataset(dataset):
     # Workaround: unbatch and then batch with explicit BATCH_SIZE
+
     dataset = dataset.unbatch()
     dataset = dataset.batch(BATCH_SIZE, drop_remainder=True).repeat()
+
+    dataset = dataset.cache()
+    dataset = dataset.prefetch(16)
+
+    if args.input_dtype == 'fp16':
+       	dataset = dataset.map(lambda x : tf.cast(x, np.float16))
+    elif args.input_dtype == 'int8':
+        dataset = dataset.map(lambda x : (tf.cast(x[0], np.uint8), x[1]))
+        #dataset = dataset.map(lambda x : x*x)
+
     dataset = optimise_io(dataset)
   
     # shard for distributed training with poprun
@@ -182,6 +197,9 @@ def train_model(model):
         image_size=(IMAGE_SHAPE[0], IMAGE_SHAPE[1]),
         #This does not achieve a defined shape in dimention 1: batch_size=BATCH_SIZE
         )
+
+    print(training_dataset)
+    print(training_dataset.element_spec)
 
     validation_dataset = tf.keras.preprocessing.image_dataset_from_directory(
         train_data_dir,
